@@ -7,7 +7,7 @@ trap 'printf "${YELLOW}\nDownload interrupted. You can resume by re-running the 
 display_help() {
     cat << EOF
 Usage:
-  hfd <REPO_ID> [--include include_pattern1 include_pattern2 ...] [--exclude exclude_pattern1 exclude_pattern2 ...] [--hf_username username] [--hf_token token] [--tool aria2c|wget] [-x threads] [-j jobs] [--dataset] [--local-dir path] [--revision rev]
+  hfd <REPO_ID> [--include include_pattern1 include_pattern2 ...] [--exclude exclude_pattern1 exclude_pattern2 ...] [--include-dir dir1 dir2 ...] [--exclude-dir dir1 dir2 ...] [--hf_username username] [--hf_token token] [--tool aria2c|wget] [-x threads] [-j jobs] [--retries n] [--retry-wait sec] [--dataset] [--local-dir path] [--revision rev]
 
 Description:
   Downloads a model or dataset from Hugging Face using the provided repo ID.
@@ -20,11 +20,15 @@ Options:
                   e.g., '--exclude *.safetensor *.md', '--include vae/*'.
   --include       (Optional) Patterns to include files for downloading (supports multiple patterns).
   --exclude       (Optional) Patterns to exclude files from downloading (supports multiple patterns).
+  --include-dir   (Optional) Directories (relative to repo root) to include, e.g. 'vae text_encoder/sub' (supports multiple dirs).
+  --exclude-dir   (Optional) Directories (relative to repo root) to exclude (supports multiple dirs).
   --hf_username   (Optional) Hugging Face username for authentication (not email).
   --hf_token      (Optional) Hugging Face token for authentication.
   --tool          (Optional) Download tool to use: aria2c (default) or wget.
   -x              (Optional) Number of download threads for aria2c (default: 4).
   -j              (Optional) Number of concurrent downloads for aria2c (default: 5).
+  --retries       (Optional) Number of tries per file, 0 = unlimited (default: 0). aria2c --max-tries / wget --tries.
+  --retry-wait    (Optional) Seconds to wait between retries, 0-600 (default: 5). aria2c --retry-wait / wget --waitretry.
   --dataset       (Optional) Flag to indicate downloading a dataset.
   --local-dir     (Optional) Directory path to store the downloaded data.
                              Defaults to the current directory with a subdirectory named 'repo_name'
@@ -34,6 +38,7 @@ Options:
 Example:
   hfd gpt2
   hfd bigscience/bloom-560m --exclude *.safetensors
+  hfd stabilityai/stable-diffusion-xl-base-1.0 --include-dir vae unet --exclude-dir text_encoder_2
   hfd meta-llama/Llama-2-7b --hf_username myuser --hf_token mytoken -x 4
   hfd lavita/medical-qa-shared-task-v1-toy --dataset
   hfd bartowski/Phi-3.5-mini-instruct-exl2 --revision 5_0
@@ -50,6 +55,8 @@ shift
 TOOL="aria2c"
 THREADS=4
 CONCURRENT=5
+RETRIES=0
+RETRY_WAIT=5
 # HF_ENDPOINT=${HF_ENDPOINT:-"https://huggingface.co"}
 HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
 INCLUDE_PATTERNS=()
@@ -60,11 +67,20 @@ validate_number() {
     [[ "$2" =~ ^[1-9][0-9]*$ && "$2" -le "$3" ]] || { printf "${RED}[Error] $1 must be 1-$3${NC}\n"; exit 1; }
 }
 
+# Like validate_number but allows 0; the max ($3) is optional.
+validate_non_negative() {
+    local range="${3:+0-$3}"
+    [[ "$2" =~ ^(0|[1-9][0-9]*)$ ]] && [[ -z "$3" || "$2" -le "$3" ]] || { printf "${RED}[Error] $1 must be ${range:-a non-negative integer}${NC}\n"; exit 1; }
+}
+
 # Argument parsing
 while [[ $# -gt 0 ]]; do
     case $1 in
         --include) shift; while [[ $# -gt 0 && ! ($1 =~ ^--) && ! ($1 =~ ^-[^-]) ]]; do INCLUDE_PATTERNS+=("$1"); shift; done ;;
         --exclude) shift; while [[ $# -gt 0 && ! ($1 =~ ^--) && ! ($1 =~ ^-[^-]) ]]; do EXCLUDE_PATTERNS+=("$1"); shift; done ;;
+        # ponytail: --include-dir/--exclude-dir reuse the pattern arrays as anchored prefixes "^dir/" (union with --include/--exclude).
+        --include-dir) shift; while [[ $# -gt 0 && ! ($1 =~ ^--) && ! ($1 =~ ^-[^-]) ]]; do INCLUDE_PATTERNS+=("^${1%/}/"); shift; done ;;
+        --exclude-dir) shift; while [[ $# -gt 0 && ! ($1 =~ ^--) && ! ($1 =~ ^-[^-]) ]]; do EXCLUDE_PATTERNS+=("^${1%/}/"); shift; done ;;
         --hf_username) HF_USERNAME="$2"; shift 2 ;;
         --hf_token) HF_TOKEN="$2"; shift 2 ;;
         --tool)
@@ -81,6 +97,8 @@ while [[ $# -gt 0 ]]; do
             ;;
         -x) validate_number "threads (-x)" "$2" 10; THREADS="$2"; shift 2 ;;
         -j) validate_number "concurrent downloads (-j)" "$2" 10; CONCURRENT="$2"; shift 2 ;;
+        --retries) validate_non_negative "retries (--retries)" "$2"; RETRIES="$2"; shift 2 ;;
+        --retry-wait) validate_non_negative "retry wait (--retry-wait)" "$2" 600; RETRY_WAIT="$2"; shift 2 ;;
         --dataset) DATASET=1; shift ;;
         --local-dir) LOCAL_DIR="$2"; shift 2 ;;
         --revision) REVISION="$2"; shift 2 ;;
@@ -316,9 +334,10 @@ printf "${YELLOW}Starting download with $TOOL to $LOCAL_DIR...\n${NC}"
 
 cd "$LOCAL_DIR"
 if [[ "$TOOL" == "aria2c" ]]; then
-    aria2c --console-log-level=error --file-allocation=none -x "$THREADS" -j "$CONCURRENT" -s "$THREADS" -k 1M -c -i "$fileslist_file" --save-session="$fileslist_file"
+    aria2c --console-log-level=error --file-allocation=none -x "$THREADS" -j "$CONCURRENT" -s "$THREADS" -k 1M -c --max-tries="$RETRIES" --retry-wait="$RETRY_WAIT" -i "$fileslist_file" --save-session="$fileslist_file"
 elif [[ "$TOOL" == "wget" ]]; then
-    wget -x -nH --cut-dirs="$CUT_DIRS" ${HF_TOKEN:+--header="Authorization: Bearer $HF_TOKEN"} --input-file="$fileslist_file" --continue
+    # ponytail: --retry-connrefused retries refused connections, as aria2c does. wget --waitretry backs off 1..S seconds instead of a fixed S.
+    wget -x -nH --cut-dirs="$CUT_DIRS" ${HF_TOKEN:+--header="Authorization: Bearer $HF_TOKEN"} --tries="$RETRIES" --waitretry="$RETRY_WAIT" --retry-connrefused --input-file="$fileslist_file" --continue
 fi
 
 if [[ $? -eq 0 ]]; then
